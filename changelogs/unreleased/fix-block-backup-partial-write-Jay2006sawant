@@ -1,0 +1,13 @@
+fix(block): write only actual bytes for partial last block during backup
+
+The block uploader backupWriteProc always wrote full blockSize bytes and
+advanced lastPos by the full block, even when backupReadProc read a
+shorter trailing block for non-aligned volumes. This caused short writes,
+incorrect progress, and duplicate tail data via copyTailData.
+
+Track read length in readResult, use readResultWriteLength in backup and
+restore write paths, and skip copyTailData when the partial block was
+already written. Also fix Restore error messages that incorrectly wrapped
+a stale err value.
+
+Signed-off-by: Jay2006sawant <jay242902@gmail.com>

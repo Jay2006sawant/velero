@@ -167,11 +167,11 @@ func (blkup *blockUploader) Restore(snapshot udmrepo.Snapshot, dest destInfo, bi
 	}
 
 	if sourceSize > meta.SubObjects[0].Size {
-		return 0, errors.Wrapf(err, "unexpected size (%v vs. %v) for bdev object %s", meta.SubObjects[0].Size, sourceSize, meta.SubObjects[0].Name)
+		return 0, errors.Errorf("unexpected size (%v vs. %v) for bdev object %s", meta.SubObjects[0].Size, sourceSize, meta.SubObjects[0].Name)
 	}
 
 	if sourceSize > dest.size {
-		return 0, errors.Wrapf(err, "dest dev(%s) size is too small (%v vs. %v)", dest.path, dest.size, sourceSize)
+		return 0, errors.Errorf("dest dev(%s) size is too small (%v vs. %v)", dest.path, dest.size, sourceSize)
 	}
 
 	reader, err := blkup.repoWriter.OpenObject(blkup.ctx, meta.SubObjects[0].ID)
@@ -201,6 +201,7 @@ func (blkup *blockUploader) backupObject(dev *os.File, dest udmrepo.ObjectWriter
 type readResult struct {
 	buffer []byte
 	offset int64
+	length int
 	err    error
 }
 
@@ -233,7 +234,7 @@ func (blkup *blockUploader) backupData(reader io.ReaderAt, writer udmrepo.Object
 	go func() {
 		defer wg.Done()
 		defer close(quit)
-		written, lastPos, writeErr = backupWriteProc(blkup.ctx, writer, resultChan, list, aligned, totalCount, int(blockSize), blkup.progress)
+		written, lastPos, writeErr = backupWriteProc(blkup.ctx, writer, resultChan, list, totalLength, aligned, totalCount, int(blockSize), blkup.progress)
 	}()
 
 	wg.Wait()
@@ -242,7 +243,7 @@ func (blkup *blockUploader) backupData(reader io.ReaderAt, writer udmrepo.Object
 		return written, aligned, errors.Wrap(writeErr, "error writing data")
 	}
 
-	if lastPos < aligned {
+	if lastPos < totalLength {
 		s, err := copyTailData(reader, writer, totalLength, int64(blockSize))
 		if err != nil {
 			return written, aligned, errors.Wrapf(err, "unable to write tail data at %v", lastPos)
@@ -285,6 +286,7 @@ func backupReadProc(ctx context.Context, reader io.ReaderAt, resultChan chan rea
 		r := readResult{
 			buffer: buffer,
 			offset: int64(offset),
+			length: int(length),
 			err:    err,
 		}
 
@@ -302,7 +304,14 @@ func backupReadProc(ctx context.Context, reader io.ReaderAt, resultChan chan rea
 	}
 }
 
-func backupWriteProc(ctx context.Context, writer udmrepo.ObjectWriter, resultChan chan readResult, list *freelist.FreeList, totalLength int64,
+func readResultWriteLength(result readResult, blockSize int, dataLength int64) int64 {
+	if result.length > 0 {
+		return int64(result.length)
+	}
+	return min(int64(blockSize), dataLength-result.offset)
+}
+
+func backupWriteProc(ctx context.Context, writer udmrepo.ObjectWriter, resultChan chan readResult, list *freelist.FreeList, dataLength int64, alignedLength int64,
 	totalCount int64, blockSize int, progress uploader.ProgressUpdater) (int64, int64, error) {
 	var lastPos int64
 	var result readResult
@@ -337,23 +346,24 @@ func backupWriteProc(ctx context.Context, writer udmrepo.ObjectWriter, resultCha
 			break
 		}
 
-		n, err := writer.WriteAt(result.buffer, result.offset)
+		writeLen := readResultWriteLength(result, blockSize, dataLength)
+		n, err := writer.WriteAt(result.buffer[:writeLen], result.offset)
 		if err != nil {
 			writeErr = err
 			break
 		}
 
-		if blockSize != n {
+		if writeLen != int64(n) {
 			writeErr = io.ErrShortWrite
 			break
 		}
 
-		written += int64(blockSize)
-		lastPos = result.offset + int64(blockSize)
+		written += writeLen
+		lastPos = result.offset + writeLen
 		result.resetBuffer(list)
 		curCount++
 
-		progress.UpdateProgress(&uploader.Progress{BytesDone: lastPos, TotalBytes: totalLength})
+		progress.UpdateProgress(&uploader.Progress{BytesDone: lastPos, TotalBytes: alignedLength})
 	}
 
 	result.resetBuffer(list)
@@ -448,13 +458,13 @@ func restoreReadProc(ctx context.Context, reader io.ReadSeeker, resultChan chan 
 		}
 
 		var err error
+		var length int
 
 		if nextPos != offset {
 			_, err = reader.Seek(int64(offset), io.SeekStart)
 		}
 
 		if err == nil {
-			var length int
 			length, err = io.ReadFull(reader, buffer)
 			if err == nil && length <= 0 {
 				err = io.ErrUnexpectedEOF
@@ -464,6 +474,7 @@ func restoreReadProc(ctx context.Context, reader io.ReadSeeker, resultChan chan 
 		r := readResult{
 			buffer: buffer,
 			offset: int64(offset),
+			length: length,
 			err:    err,
 		}
 
@@ -520,8 +531,8 @@ func restoreWriteProc(ctx context.Context, dest *os.File, resultChan chan readRe
 			break
 		}
 
-		length := min(int64(blockSize), totalLength-result.offset)
-		if bytes.Equal(result.buffer, zeroBlock) {
+		length := readResultWriteLength(result, blockSize, totalLength)
+		if bytes.Equal(result.buffer[:length], zeroBlock[:length]) {
 			if zeroStart == -1 {
 				zeroStart = result.offset
 				zeroLength = length
